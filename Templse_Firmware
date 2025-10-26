@@ -1,0 +1,293 @@
+#define BLYNK_TEMPLATE_ID ""
+#define BLYNK_TEMPLATE_NAME ""
+#define BLYNK_AUTH_TOKEN ""
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Wire.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_MLX90614.h>
+#include <millisDelay.h>
+#include <BlynkSimpleEsp32.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+
+// WiFi Credentials
+const char* ssid ="";
+const char* password = "";
+
+// ThingSpeak
+const char* server = "";
+const String apiKey = "";
+
+// Hardware Pins
+#define GREEN_LED     18
+#define RED_LED       19
+#define BUZZER        4
+#define IR_SENSOR     5
+#define PULSE_SENSOR  34
+
+// Timing
+const unsigned long TEMP_SAMPLE_INTERVAL = 50;
+const unsigned long PULSE_SAMPLE_INTERVAL = 2;
+const unsigned long DISPLAY_UPDATE = 500;
+const unsigned long MEASUREMENT_TIMEOUT = 3000;
+const unsigned long LED_HOLD_RED = 5000;
+const unsigned long LED_HOLD_GREEN = 1000;
+const unsigned long SERIAL_PRINT_INTERVAL = 1000;
+
+// Display and sensors
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+Adafruit_MLX90614 mlx = Adafruit_MLX90614();
+
+bool measurementActive = false;
+bool temperatureReady = false;
+float currentTemperature = -1;
+int currentBPM = 0;
+
+unsigned long measurementStartTime = 0;
+unsigned long lastBeatTime = 0;
+unsigned long lastSerialPrint = 0;
+
+millisDelay tempDelay, pulseDelay, displayDelay, ledDelay;
+
+// Pulse signal smoothing
+int signalMax = 2000;
+int signalMin = 1500;
+bool pulseDetected = false;
+int threshold = (signalMax + signalMin) / 2;
+
+const int BPM_HISTORY_SIZE = 10;
+int bpmHistory[BPM_HISTORY_SIZE];
+int bpmIndex = 0;
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22);
+
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, password);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED failed");
+    while (1);
+  }
+
+  if (!mlx.begin()) {
+    Serial.println("MLX90614 failed");
+    while (1);
+  }
+
+  pinMode(IR_SENSOR, INPUT_PULLUP);
+  pinMode(GREEN_LED, OUTPUT);
+  pinMode(RED_LED, OUTPUT);
+  pinMode(BUZZER, OUTPUT);
+  pinMode(PULSE_SENSOR, INPUT);
+
+  showStartupScreen();
+  pulseDelay.start(PULSE_SAMPLE_INTERVAL);
+  displayDelay.start(DISPLAY_UPDATE);
+  display.clearDisplay();
+  display.display();
+}
+
+void loop() {
+  Blynk.run();
+  handleIRTrigger();
+  handleTemperatureMeasurement();
+  handlePulseMeasurement();
+  updateDisplay();
+  handleLEDState();
+}
+
+void showStartupScreen() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(20, 20);
+  display.println("Initializing...");
+  display.display();
+  delay(1000);
+}
+
+void handleIRTrigger() {
+  if (digitalRead(IR_SENSOR) == LOW && !measurementActive) {
+    startNewMeasurement();
+    delay(200);
+  }
+}
+
+void startNewMeasurement() {
+  measurementActive = true;
+  temperatureReady = false;
+  currentTemperature = -1;
+  measurementStartTime = millis();
+  tempDelay.start(TEMP_SAMPLE_INTERVAL);
+  Serial.println("\n--- New Measurement Started ---");
+}
+
+void handleTemperatureMeasurement() {
+  if (!measurementActive) return;
+  if (millis() - measurementStartTime > MEASUREMENT_TIMEOUT) {
+    Serial.println("Temperature timeout.");
+    resetSystem();
+    return;
+  }
+
+  if (tempDelay.justFinished()) {
+    tempDelay.repeat();
+    static float tempSum = 0;
+    static uint8_t count = 0;
+    float raw = mlx.readObjectTempC();
+
+    if (!isnan(raw)) {
+      tempSum += raw;
+      count++;
+      Serial.printf("Temp Sample %d: %.1fC\n", count, raw);
+    }
+
+    if (count >= 20) {
+      currentTemperature = tempSum / 20;
+      count = 0; tempSum = 0;
+      temperatureReady = true;
+      measurementActive = false;
+      Serial.printf("Final Temperature: %.1f°C\n", currentTemperature);
+
+      sendToThingSpeak(currentTemperature, currentBPM);
+      sendToBlynk(currentTemperature, currentBPM);
+      activateResultIndicators();
+    }
+  }
+}
+
+void handlePulseMeasurement() {
+  if (!pulseDelay.justFinished()) return;
+  pulseDelay.repeat();
+
+  int raw = analogRead(PULSE_SENSOR);
+  unsigned long now = millis();
+
+  if (now - lastSerialPrint > SERIAL_PRINT_INTERVAL) {
+    Serial.printf("Temp: %.1f°C | Pulse: %d | BPM: %d\n",
+                  currentTemperature, raw, currentBPM);
+    lastSerialPrint = now;
+  }
+
+  signalMax = signalMax * 0.995 + raw * 0.005;
+  signalMin = signalMin * 0.995 + raw * 0.005;
+  threshold = (signalMax + signalMin) / 2;
+
+  if (raw > threshold && !pulseDetected && (now - lastBeatTime > 200)) {
+    pulseDetected = true;
+    if (lastBeatTime > 0) {
+      int interval = now - lastBeatTime;
+      float rawBPM = 60000.0 / interval;
+      if (rawBPM >= 40 && rawBPM <= 200) {
+        addToBPMHistory(round(rawBPM));
+      }
+    }
+    lastBeatTime = now;
+  }
+
+  if (raw < threshold) {
+    pulseDetected = false;
+  }
+
+  if (now - lastBeatTime > 5000) {
+    currentBPM = 0;
+    signalMax = 2000;
+    signalMin = 1500;
+    threshold = (signalMax + signalMin) / 2;
+  }
+}
+
+void addToBPMHistory(int newBPM) {
+  bpmHistory[bpmIndex++] = newBPM;
+  if (bpmIndex >= BPM_HISTORY_SIZE) bpmIndex = 0;
+
+  int sum = 0;
+  for (int i = 0; i < BPM_HISTORY_SIZE; i++) sum += bpmHistory[i];
+  currentBPM = sum / BPM_HISTORY_SIZE;
+}
+
+void updateDisplay() {
+  if (!displayDelay.justFinished()) return;
+  displayDelay.repeat();
+
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setCursor(0, 0);
+
+  if (measurementActive) {
+    display.print("Measuring...");
+  } else if (temperatureReady) {
+    display.printf("%.1fC", currentTemperature);
+  } else {
+    display.print("Ready");
+  }
+
+  display.setTextSize(1);
+  display.setCursor(0, 35);
+  display.print("Heart Rate:");
+
+  display.setTextSize(2);
+  display.setCursor(0, 45);
+  if (currentBPM > 0) {
+    display.printf("%d BPM", currentBPM);
+  } else {
+    int pulseValue = analogRead(PULSE_SENSOR);
+    if (pulseValue > threshold) display.print("Wait...");
+    else display.print("---");
+  }
+
+  display.display();
+}
+
+void activateResultIndicators() {
+  digitalWrite(BUZZER, HIGH);
+  if (currentTemperature > 38.0) {
+    digitalWrite(RED_LED, HIGH);
+    ledDelay.start(LED_HOLD_RED);
+  } else {
+    digitalWrite(GREEN_LED, HIGH);
+    ledDelay.start(LED_HOLD_GREEN);
+  }
+}
+
+void handleLEDState() {
+  if (ledDelay.justFinished()) {
+    digitalWrite(RED_LED, LOW);
+    digitalWrite(GREEN_LED, LOW);
+    digitalWrite(BUZZER, LOW);
+    temperatureReady = false;
+  }
+}
+
+void resetSystem() {
+  measurementActive = false;
+  temperatureReady = false;
+  currentTemperature = -1;
+  digitalWrite(RED_LED, LOW);
+  digitalWrite(GREEN_LED, LOW);
+  digitalWrite(BUZZER, LOW);
+}
+
+void sendToThingSpeak(float temp, int bpm) {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  String url = server + String("/update?api_key=") + apiKey
+             + "&field1=" + String(temp, 1)
+             + "&field2=" + String(bpm);
+
+  http.begin(url);
+  int response = http.GET();
+  Serial.print("ThingSpeak Response: ");
+  Serial.println(response);
+  http.end();
+}
+
+void sendToBlynk(float temp, int bpm) {
+  Blynk.virtualWrite(V0, temp);
+  Blynk.virtualWrite(V1, bpm);
+}
